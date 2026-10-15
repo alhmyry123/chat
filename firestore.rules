@@ -1,0 +1,103 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && request.auth.token.banned != true
+        && (!exists(/databases/$(database)/documents/users/$(request.auth.uid))
+          || get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isBanned != true);
+    }
+    function chatMember(chatId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/chats/$(chatId))
+        && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.members;
+    }
+    function isRoomOwner(roomId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/rooms/$(roomId))
+        && get(/databases/$(database)/documents/rooms/$(roomId)).data.ownerId == request.auth.uid;
+    }
+
+    match /reports/{reportId} {
+      allow read, write: if false; // submissions and moderation are handled by trusted Cloud Functions
+    }
+
+    match /announcements/{announcementId} {
+      allow read, write: if false; // announcements are administered on the server
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.auth.uid == userId
+        && request.resource.data.email == request.auth.token.email
+        && !('isBanned' in request.resource.data)
+        && !('admin' in request.resource.data)
+        && !('role' in request.resource.data);
+      // User can only edit their own profile/token/presence, never another user's profile.
+      allow update: if signedIn() && request.auth.uid == userId
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['displayName', 'lastSeen', 'isOnline', 'fcmTokens', 'phoneNumber', 'photoUrl']);
+      allow delete: if false;
+    }
+
+    match /rooms/{roomId} {
+      allow read: if signedIn() && request.auth.uid in resource.data.members;
+      allow create: if signedIn()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.members.size() == 1
+        && request.auth.uid in request.resource.data.members
+        && request.resource.data.mutedMembers.size() == 0;
+      // Membership, owner, and mute lists are server-managed only.
+      allow update, delete: if false;
+    }
+
+    match /chats/{chatId} {
+      allow read: if chatMember(chatId);
+      allow create: if signedIn()
+        && request.auth.uid in request.resource.data.members
+        && request.resource.data.members.size() <= 2;
+      // Members cannot change membership, room type, title or other protected fields.
+      // Only own typing flag and last-message metadata can be updated by members.
+      allow update: if chatMember(chatId)
+        && request.resource.data.members == resource.data.members
+        && request.resource.data.isRoom == resource.data.isRoom
+        && request.resource.data.title == resource.data.title
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['lastMessage', 'updatedAt', 'typing']);
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if chatMember(chatId);
+        allow create: if chatMember(chatId)
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.deletedFor.size() == 0
+          && request.resource.data.deletedForEveryone == false
+          && (
+            !get(/databases/$(database)/documents/chats/$(chatId)).data.isRoom
+            || !(request.auth.uid in get(/databases/$(database)/documents/rooms/$(chatId)).data.mutedMembers)
+          );
+        // Clients may only add themselves to readBy or deletedFor.
+        // They cannot delete for everyone or edit message content.
+        allow update: if chatMember(chatId)
+          && request.resource.data.senderId == resource.data.senderId
+          && (
+            (
+              request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy'])
+              && request.resource.data.readBy is list
+              && request.resource.data.readBy.hasAll(resource.data.readBy)
+              && request.auth.uid in request.resource.data.readBy
+            )
+            ||
+            (
+              request.resource.data.diff(resource.data).affectedKeys().hasOnly(['deletedFor'])
+              && request.resource.data.deletedFor is list
+              && request.resource.data.deletedFor.hasAll(resource.data.deletedFor)
+              && request.auth.uid in request.resource.data.deletedFor
+            )
+          );
+        allow delete: if false;
+      }
+    }
+  }
+}

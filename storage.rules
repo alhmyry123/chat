@@ -1,0 +1,17 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function verifiedMember(chatId) {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && request.auth.token.banned != true
+        && (!firestore.exists(/databases/(default)/documents/users/$(request.auth.uid))
+          || firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.isBanned != true)
+        && firestore.get(/databases/(default)/documents/chats/$(chatId)).data.members.hasAny([request.auth.uid]);
+    }
+    match /chat_uploads/{chatId}/{fileName} {
+      allow read: if verifiedMember(chatId);
+      allow write: if verifiedMember(chatId) && request.resource.size < 100 * 1024 * 1024;
+    }
+  }
+}
